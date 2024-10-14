@@ -10,10 +10,9 @@ data:extend({
     name = "dispatcher-station",
     icons =
     {
-      {icon = "__Dispatcher__/graphics/icons/shape_square.png"},
-      {icon = "__Dispatcher__/graphics/icons/dispatcher.png"}
+      {icon = "__Dispatcher__/graphics/icons/shape_square.png", icon_size=32},
+      {icon = "__Dispatcher__/graphics/icons/dispatcher.png", icon_size=32}
     },
-    icon_size = 32, icon_mipmaps = 1,
     subgroup = "dispatcher-signals",
     order = "a-a"
   },

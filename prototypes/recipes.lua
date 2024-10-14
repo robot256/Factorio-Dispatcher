@@ -6,10 +6,10 @@ data:extend({
     enabled = false,
     ingredients =
     {
-      {"iron-plate", 20},
-      {"steel-plate", 20},
-      {"advanced-circuit", 20}
+      {type="item", name="iron-plate", amount=20},
+      {type="item", name="steel-plate", amount=20},
+      {type="item", name="advanced-circuit", amount=20}
     },
-    result = "train-stop-dispatcher"
+    results = {{type="item", name="train-stop-dispatcher", amount=1}}
   }
 })

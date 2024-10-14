@@ -1,4 +1,11 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.4.0
+Date: 14. 10. 2024
+  Features:
+    - Updated for Factorio 2.0.
+  Changes:
+    - Uses conditional on_tick subscription and on_object_destroyed registration for better performance.
+---------------------------------------------------------------------------------------------------
 Version: 1.3.1
 Date: 21. 05. 2022
   Features:

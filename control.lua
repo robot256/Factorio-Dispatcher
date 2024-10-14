@@ -5,17 +5,32 @@ local SIGNAL_DISPATCH = {type="virtual", name="dispatcher-station"}
 local NAME_SEPARATOR = "."
 local NAME_SEPARATOR_REGEX = "%."
 
--- Initiate global variables when activating the mod
+-- Only use on_tick event when there is a train waiting for a signal at a station
+-- Use this function to restore the correct event state when the save is loaded or trains are added/removed
+function register_on_tick()
+  if table_size(storage.awaiting_dispatch) > 0 then
+    script.on_event(defines.events.on_tick, tick)
+  else
+    script.on_event(defines.events.on_tick, nil)
+  end
+end
+
+script.on_load(register_on_tick)
+
+-- Initiate storage variables when activating the mod
 script.on_init(function()
   -- Store all the train awaiting dispatch
   -- (we need to keep track of these trains in order to dispatch a train when a dispatch signal is sent)
-  global.awaiting_dispatch = {}
+  storage.awaiting_dispatch = {}
 
   -- Store all the stations per surface
   -- (we need it cached for performance reasons)
-  global.stations = {}
+  storage.stations = {}
+  storage.station_ids = {}
 
-  global.debug = false
+  storage.debug = false
+  
+  register_on_tick()
 end)
 
 
@@ -28,73 +43,78 @@ script.on_configuration_changed(function(data)
     -- Mod version upgraded
     if old_version then
       if old_version < "1.0.2" then
-        global.debug = false
+        storage.debug = false
       end
     end
 
-    local debug_temp = global.debug
-    global.debug = true
+    local debug_temp = storage.debug
+    storage.debug = true
 
-    -- Build the list of stations on the map
+    -- Build the list of stations on the map (also migrates old data and registers units)
     build_list_stations()
     -- Scrub train list to remove ones that don't exist anymore
     scrub_trains()
 
     -- Complete the migration if no dispatched trains remain in list
-    if global.dispatched then
-      if next(global.dispatched) then
+    if storage.dispatched then
+      if next(storage.dispatched) then
         debug("Dispatcher: WARNING! Could not migrate all dispatched trains. Please upload save file to the Dispatcher mod page.")
       else
         debug("Dispatcher: Completed migrating dispatched trains to temporary schedule records.")
-        global.dispatched = nil
+        storage.dispatched = nil
       end
     end
 
-    global.debug = debug_temp
+    storage.debug = debug_temp
+    
+    register_on_tick()
   end
 end)
 
 
--- Add new station to global.stations if it meets our criteria
+-- Add new station to storage.stations if it meets our criteria
 function add_station(entity)
   local name = entity.backer_name
   local id = entity.unit_number
   local surface_index = entity.surface.index
   if entity.name == NAME_DISPATCHER_ENTITY or name:match(NAME_SEPARATOR_REGEX.."[123456789]%d*$") then
-    if not global.stations[surface_index] then
-      global.stations[surface_index] = {}
+    if not storage.stations[surface_index] then
+      storage.stations[surface_index] = {}
     end
-    if not global.stations[surface_index][name] then
-      global.stations[surface_index][name] = {}
-      global.stations[surface_index][name][id] = entity
+    if not storage.stations[surface_index][name] then
+      storage.stations[surface_index][name] = {}
+      storage.stations[surface_index][name][id] = entity
       debug("Added first station: ", game.surfaces[surface_index].name.."/"..name)
     else
-      global.stations[surface_index][name][id] = entity
+      storage.stations[surface_index][name][id] = entity
       debug("Added station: ", game.surfaces[surface_index].name.."/"..name)
     end
+    storage.station_ids[id] = {entity=entity, surface_index=surface_index, name=name}
+    script.register_on_object_destroyed(entity)
   else
     --debug("Ignoring new station: ", game.surfaces[surface_index].name.."/"..name)
   end
 end
 
--- Remove station from global.stations if it is in the list
+-- Remove station from storage.stations if it is in the list
 function remove_station(entity, old_name)
   local name = old_name or entity.backer_name
   local id = entity.unit_number
   local surface_index = entity.surface.index
-  if global.stations[surface_index] and global.stations[surface_index][name] and global.stations[surface_index][name][id] then
-    global.stations[surface_index][name][id] = nil
-    if not next(global.stations[surface_index][name]) then
-      global.stations[surface_index][name] = nil
+  if storage.stations[surface_index] and storage.stations[surface_index][name] and storage.stations[surface_index][name][id] then
+    storage.stations[surface_index][name][id] = nil
+    if not next(storage.stations[surface_index][name]) then
+      storage.stations[surface_index][name] = nil
       debug("Removed last station named: ", game.surfaces[surface_index].name.."/"..name)
-      if not next(global.stations[surface_index]) then
-        global.stations[surface_index] = nil
+      if not next(storage.stations[surface_index]) then
+        storage.stations[surface_index] = nil
         debug("Removed last station from surface "..game.surfaces[surface_index].name)
       end
     else
       debug("Removed station: ", game.surfaces[surface_index].name.."/"..name)
     end
   end
+  storage.station_ids[id] = nil
 end
 
 -- Add stations when built/revived
@@ -114,24 +134,41 @@ function entity_cloned(event)
     add_station(entity)
   elseif entity.type == "locomotive" and event.source then
     local previous_id = event.source.train.id
-    if global.awaiting_dispatch[previous_id] and global.awaiting_dispatch[previous_id].schedule then
+    if storage.awaiting_dispatch[previous_id] and storage.awaiting_dispatch[previous_id].schedule then
       -- Copy saved schedule from source to the cloned train, because it starts in manual mode
       local new_train = entity.train
-      debug("Cloning saved schedule from train "..tostring(previous_id).." to train "..tostring(new_train.id)..": "..serpent.line(global.awaiting_dispatch[previous_id].schedule))
-      new_train.schedule = global.awaiting_dispatch[previous_id].schedule
+      debug("Cloning saved schedule from train "..tostring(previous_id).." to train "..tostring(new_train.id)..": "..serpent.line(storage.awaiting_dispatch[previous_id].schedule))
+      new_train.schedule = storage.awaiting_dispatch[previous_id].schedule
     end
   end
 end
 script.on_event(defines.events.on_entity_cloned, entity_cloned, {{filter="type", type="train-stop"}, {filter="type", type="locomotive"}})
 
 -- Remove station when mined/destroyed
-function entity_removed(event)
-  remove_station(event.entity)
+-- Purge this station by unit number only
+function object_destroyed(event)
+  if event.type == defines.target_type.entity then
+    local id = event.useful_id
+    local data = storage.station_ids[id]
+    if data and storage.stations[data.surface_index] and storage.stations[data.surface_index][data.name] then
+      local surface_index = data.surface_index
+      local name = data.name
+      storage.stations[surface_index][name][id] = nil
+      if not next(storage.stations[surface_index][name]) then
+        storage.stations[surface_index][name] = nil
+        debug("Removed last station named: ", game.surfaces[surface_index].name.."/"..name)
+        if not next(storage.stations[surface_index]) then
+          storage.stations[surface_index] = nil
+          debug("Removed last station from surface "..game.surfaces[surface_index].name)
+        end
+      else
+        debug("Removed station: ", game.surfaces[surface_index].name.."/"..name)
+      end
+    end
+    storage.station_ids[id] = nil
+  end
 end
-script.on_event(defines.events.on_player_mined_entity, entity_removed, {{filter="type", type="train-stop"}})
-script.on_event(defines.events.on_robot_mined_entity, entity_removed, {{filter="type", type="train-stop"}})
-script.on_event(defines.events.on_entity_died, entity_removed, {{filter="type", type="train-stop"}})
-script.on_event(defines.events.script_raised_destroy, entity_removed, {{filter="type", type="train-stop"}})
+script.on_event(defines.events.on_object_destroyed, object_destroyed)
 
 -- Update station when renamed by player or script
 function entity_renamed(event)
@@ -146,12 +183,11 @@ script.on_event(defines.events.on_entity_renamed, entity_renamed)
 
 -- Build list of stations
 function build_list_stations()
-  global.stations = {}
-  for _,surface in pairs(game.surfaces) do
-    local stations = surface.get_train_stops()
-    for _,station in pairs(stations) do
-      add_station(station)
-    end
+  storage.stations = {}
+  storage.station_ids = {}
+  local stations = game.train_manager.get_train_stops{}
+  for _,station in pairs(stations) do
+    add_station(station)
   end
   debug("Stations list rebuilt")
 end
@@ -160,17 +196,18 @@ end
 -- Scrub list of trains
 function scrub_trains()
   -- Look for trains awaiting dispatch that disappeared during configuration change
-  for id,ad in pairs(global.awaiting_dispatch) do
+  for id,ad in pairs(storage.awaiting_dispatch) do
     if not(ad.train and ad.train.valid) then
-      global.awaiting_dispatch[id] = nil
+      storage.awaiting_dispatch[id] = nil
       debug("Scrubbed train " .. id .. " from Awaiting Dispatch list.")
     end
   end
+  register_on_tick()
   -- Migrate currently dispatched trains to use temporary stops, so we don't have to track them anymore
-  if global.dispatched then
-    for id,d in pairs(global.dispatched) do
+  if storage.dispatched then
+    for id,d in pairs(storage.dispatched) do
       if not(d.train and d.train.valid) then
-        global.dispatched[id] = nil
+        storage.dispatched[id] = nil
         debug("Scrubbed train " .. id .. " from Dispatched list.")
       else
         -- Migrate schedule to use a temporary stop
@@ -178,7 +215,7 @@ function scrub_trains()
         if schedule.records[d.current] and schedule.records[d.current].station == d.station then
           schedule.records[schedule.current].temporary = true
           d.train.schedule = schedule
-          global.dispatched[id] = nil
+          storage.dispatched[id] = nil
           debug("Converted train "..id.." to temporary destination and removed from Dispatched list.")
         else
           debug("Did not convert train"..id.." to temporary destination.")
@@ -195,16 +232,16 @@ function train_changed_state(event)
   local id = train.id
 
   -- A train that is awaiting dispatch cannot change state. Restore schedule if appropriate
-  if global.awaiting_dispatch[id] then
-    local station_name = global.awaiting_dispatch[id].station_name
+  if storage.awaiting_dispatch[id] then
+    local station_name = storage.awaiting_dispatch[id].station_name
     local train_schedule = train.schedule
-    if global.awaiting_dispatch[id].schedule then
+    if storage.awaiting_dispatch[id].schedule then
       -- There is a stored schedule, restore it
-      local schedule = global.awaiting_dispatch[id].schedule
+      local schedule = storage.awaiting_dispatch[id].schedule
       train.schedule = schedule
       if train.manual_mode then
         debug("Train #", id, " set to manual mode while awaiting dispatch: schedule reset")
-      elseif not global.awaiting_dispatch[id].station or not global.awaiting_dispatch[id].station.valid then
+      elseif not storage.awaiting_dispatch[id].station or not storage.awaiting_dispatch[id].station.valid then
         debug("Train #", id, " was waiting at a dispatcher that no longer exists: schedule reset")
       else
         debug("Train #", id, " left the dispatcher: schedule reset")
@@ -228,7 +265,7 @@ function train_changed_state(event)
         train.schedule = train_schedule
         if train.manual_mode then
           debug("Train #", id, " set to manual mode while awaiting dispatch: schedule reset")
-        elseif not global.awaiting_dispatch[id].station or not global.awaiting_dispatch[id].station.valid then
+        elseif not storage.awaiting_dispatch[id].station or not storage.awaiting_dispatch[id].station.valid then
           debug("Train #", id, " was waiting at a dispatcher that no longer exists: schedule reset")
         else
           debug("Train #", id, " left the dispatcher: schedule reset")
@@ -237,15 +274,15 @@ function train_changed_state(event)
         debug("Dispatcher: WARNING! Train #", id, " no longer awaiting dispatch but schedule was not reset.")
       end
     end
-    global.awaiting_dispatch[id] = nil
+    storage.awaiting_dispatch[id] = nil
   end
 
   -- When a train arrives at a dispatcher
   local train_station = train.station
   if train.state == defines.train_state.wait_station and train_station and train_station.name == NAME_DISPATCHER_ENTITY then
-    -- Add the train to the global variable storing all the trains awaiting dispatch
+    -- Add the train to the storage variable storing all the trains awaiting dispatch
     local station_name = train_station.backer_name
-    global.awaiting_dispatch[id] = {train=train, station=train_station, station_name=station_name}
+    storage.awaiting_dispatch[id] = {train=train, station=train_station, station_name=station_name}
 
     -- Change the train schedule so that the train stays at the station
     local wait_schedule = train.schedule
@@ -255,34 +292,47 @@ function train_changed_state(event)
     train.schedule = wait_schedule
     debug("Train #", id, " has arrived to dispatcher ", train_station.surface.name, "/", station_name, ": awaiting dispatch")
   end
+  
+  register_on_tick()
 end
 script.on_event(defines.events.on_train_changed_state, train_changed_state)
 
+
+-- Check for any locomotives in the train
+local function has_locos(train)
+  if next(train.locomotives.front_movers) then
+    return true
+  end
+  if next(train.locomotives.back_movers) then
+    return true
+  end
+  return false
+end
 
 -- Track uncoupled trains (because the train id changes)
 function train_created(event)
   local ad
   if event.old_train_id_1 and event.old_train_id_2 then
-    if global.awaiting_dispatch[event.old_train_id_1] then
-      ad = global.awaiting_dispatch[event.old_train_id_1]
-    elseif global.awaiting_dispatch[event.old_train_id_2] then
-      ad = global.awaiting_dispatch[event.old_train_id_2]
+    if storage.awaiting_dispatch[event.old_train_id_1] then
+      ad = storage.awaiting_dispatch[event.old_train_id_1]
+    elseif storage.awaiting_dispatch[event.old_train_id_2] then
+      ad = storage.awaiting_dispatch[event.old_train_id_2]
     end
     if ad then
       if event.train.schedule then
         event.train.schedule = ad.schedule
         event.train.manual_mode = false
-        global.awaiting_dispatch[event.train.id] = nil
+        storage.awaiting_dispatch[event.train.id] = nil
         debug("Train #", event.old_train_id_1, " and #", event.old_train_id_2, " merged while awaiting dispatch: new train #", event.train.id, " schedule reset, and mode set to automatic")
       else
         debug("Train #", event.old_train_id_1, " and #", event.old_train_id_2, " merged while awaiting dispatch: new train #", event.train.id, " set to manual because it has no schedule")
       end
-      global.awaiting_dispatch[event.old_train_id_2] = nil
-      global.awaiting_dispatch[event.old_train_id_1] = nil
+      storage.awaiting_dispatch[event.old_train_id_2] = nil
+      storage.awaiting_dispatch[event.old_train_id_1] = nil
     end
   elseif event.old_train_id_1 then
-    if global.awaiting_dispatch[event.old_train_id_1] then
-      ad = global.awaiting_dispatch[event.old_train_id_1]
+    if storage.awaiting_dispatch[event.old_train_id_1] then
+      ad = storage.awaiting_dispatch[event.old_train_id_1]
       event.train.schedule = ad.schedule
       if has_locos(event.train) then
         event.train.manual_mode = false
@@ -296,18 +346,18 @@ end
 script.on_event(defines.events.on_train_created, train_created)
 
 
--- Executed every tick
+-- Executed every tick when a train is waiting for a signal
 function tick()
-  for id,ad in pairs(global.awaiting_dispatch) do
+  for id,ad in pairs(storage.awaiting_dispatch) do
 
     -- Ensure that the train still exists
     if not ad.train or not ad.train.valid then
-      global.awaiting_dispatch[id] = nil
+      storage.awaiting_dispatch[id] = nil
       debug("Train #", id, " no longer exists: removed from awaiting dispatch list")
 
     else
       -- Get the dispatch signal at the dispatcher, check if it is a positive number
-      local signal = ad.station.get_merged_signal(SIGNAL_DISPATCH)
+      local signal = ad.station.get_signal(SIGNAL_DISPATCH, defines.wire_connector_id.circuit_red, defines.wire_connector_id.circuit_green)
 
       if signal and signal > 0 then
         local dispatcher_name = ad.station.backer_name
@@ -315,11 +365,11 @@ function tick()
         local surface = ad.station.surface
         local surface_index = surface.index
 
-        if global.stations[surface_index] and global.stations[surface_index][name] then
+        if storage.stations[surface_index] and storage.stations[surface_index][name] then
 
           -- Search for valid destination station
           local found = false
-          for _,station in pairs(global.stations[surface_index][name]) do
+          for _,station in pairs(storage.stations[surface_index][name]) do
             -- Check that the station exists
             if station.valid then
               local cb = station.get_control_behavior()
@@ -374,7 +424,7 @@ function tick()
             end
 
             -- This train is not awaiting dispatch any more
-            global.awaiting_dispatch[id] = nil
+            storage.awaiting_dispatch[id] = nil
 
           else
             --debug("Train #", ad.train.id, " can't find any enabled station '", name, "'")
@@ -385,19 +435,11 @@ function tick()
       end
     end
   end
+  if table_size(storage.awaiting_dispatch) == 0 then
+    script.on_event(defines.events.on_tick, nil)
+  end
 end
-script.on_event(defines.events.on_tick, tick)
 
--- Check for any locomotives in the train
-function has_locos(train)
-  if next(train.locomotives.front_movers) then
-    return true
-  end
-  if next(train.locomotives.back_movers) then
-    return true
-  end
-  return false
-end
 
 
 function any_to_string(...)
@@ -418,7 +460,7 @@ end
 
 -- Debug (print text to player console)
 function debug(...)
-  if global.debug then
+  if storage.debug then
     print_game(...)
   end
 end
@@ -427,24 +469,24 @@ end
 function cmd_debug(params)
   local toggle = params.parameter
   if not toggle then
-    if global.debug then
+    if storage.debug then
       toggle = "disable"
     else
       toggle = "enable"
     end
   end
   if toggle == "disable" then
-    global.debug = false
+    storage.debug = false
     print_game("Debug mode disabled")
   elseif toggle == "enable" then
-    global.debug = true
+    storage.debug = true
     print_game("Debug mode enabled")
   elseif toggle == "dump" then
-    for v, data in pairs(global) do
+    for v, data in pairs(storage) do
       print_game(v, ": ", data)
     end
   elseif toggle == "dumplog" then
-    for v, data in pairs(global) do
+    for v, data in pairs(storage) do
       log(any_to_string(v, ": ", data))
     end
     print_game("Dump written to log file")

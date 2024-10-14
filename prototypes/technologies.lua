@@ -11,7 +11,7 @@ data:extend({
         recipe = "train-stop-dispatcher"
       }
     },
-    prerequisites = {"automated-rail-transportation", "advanced-electronics"},
+    prerequisites = {"automated-rail-transportation", "advanced-circuit"},
     unit =
     {
       count = 100,
