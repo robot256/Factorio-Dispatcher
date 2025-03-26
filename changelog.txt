@@ -1,4 +1,12 @@
 ---------------------------------------------------------------------------------------------------
+Version: 1.4.1
+Date: 26. 03. 2025
+  Features:
+    - Updated for new LuaSchedule API.
+  Bugfixes:
+    - Fixed dispatcher erasing train schedule interrupts and groups.
+    - Fixed dispatcher ignoring train limits of destination stops.
+---------------------------------------------------------------------------------------------------
 Version: 1.4.0
 Date: 14. 10. 2024
   Features:

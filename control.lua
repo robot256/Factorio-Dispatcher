@@ -41,10 +41,8 @@ script.on_configuration_changed(function(data)
     local new_version = data.mod_changes.Dispatcher.new_version
 
     -- Mod version upgraded
-    if old_version then
-      if old_version < "1.0.2" then
-        storage.debug = false
-      end
+    if old_version and old_version < "1.0.2" then
+      storage.debug = false
     end
 
     local debug_temp = storage.debug
@@ -210,11 +208,17 @@ function scrub_trains()
         storage.dispatched[id] = nil
         debug("Scrubbed train " .. id .. " from Dispatched list.")
       else
-        -- Migrate schedule to use a temporary stop
-        local schedule = d.train.schedule
-        if schedule.records[d.current] and schedule.records[d.current].station == d.station then
-          schedule.records[schedule.current].temporary = true
-          d.train.schedule = schedule
+        -- Migrate schedule to use a temporary stop (2.0 API version)
+        local schedule = d.train.get_schedule()  -- get train's schedule object_destroyed
+        local schedule_current = schedule.current
+        -- Get the record our dispatch data was pointing towards
+        local dispatched_record = (d.current <= schedule.get_record_count()) and schedule.get_record{schedule_index=d.current}
+        if dispatched_record and dispatched_record.station and dispatched_record.station == d.station then
+          dispatched_record.temporary = true
+          dispatched_record.index = {schedule_index=d.current}  -- insertion point goes in the argument table
+          schedule.remove_record{schedule_index=d.current}
+          schedule.add_record(dispatched_record)
+          schedule.go_to_station(schedule_current)
           storage.dispatched[id] = nil
           debug("Converted train "..id.." to temporary destination and removed from Dispatched list.")
         else
@@ -230,15 +234,16 @@ end
 function train_changed_state(event)
   local train = event.train
   local id = train.id
-
+  local train_schedule = train.get_schedule()
+  
   -- A train that is awaiting dispatch cannot change state. Restore schedule if appropriate
   if storage.awaiting_dispatch[id] then
     local station_name = storage.awaiting_dispatch[id].station_name
-    local train_schedule = train.schedule
     if storage.awaiting_dispatch[id].schedule then
       -- There is a stored schedule, restore it
-      local schedule = storage.awaiting_dispatch[id].schedule
-      train.schedule = schedule
+      local stored_schedule = storage.awaiting_dispatch[id].schedule
+      train_schedule.set_records(stored_schedule.records)
+      train_schedule.go_to_station(stored_schedule.current)
       if train.manual_mode then
         debug("Train #", id, " set to manual mode while awaiting dispatch: schedule reset")
       elseif not storage.awaiting_dispatch[id].station or not storage.awaiting_dispatch[id].station.valid then
@@ -250,19 +255,21 @@ function train_changed_state(event)
       -- Schedule was either completely overwritten, or player sent train to another stop
       -- Try to find the temporary waiting station we added and remove it
       local found = false
-      for i=1,#train_schedule.records do
-        if train_schedule.records[i].temporary and train_schedule.records[i].station == station_name then
-          table.remove(train_schedule.records, i)
+      for i=1,train_schedule.get_record_count() do
+        local record = train_schedule.get_record{schedule_index=i}
+        if record.temporary and record.station == station_name then
+          train_schedule.remove_record{schedule_index=i}
           -- If train was pathing to the waiting stop, send it to the previous record (the actual dispatcher arrival)
           if train_schedule.current >= i then
-            train_schedule.current = train_schedule.current - 1
+            train_schedule.go_to_station(train_schedule.current - 1)
           end
           found = true
           break
         end
       end
       if found then
-        train.schedule = train_schedule
+        train_schedule.set_records(stored_schedule.records)
+        train_schedule.go_to_station(stored_schedule.current)
         if train.manual_mode then
           debug("Train #", id, " set to manual mode while awaiting dispatch: schedule reset")
         elseif not storage.awaiting_dispatch[id].station or not storage.awaiting_dispatch[id].station.valid then
@@ -285,11 +292,9 @@ function train_changed_state(event)
     storage.awaiting_dispatch[id] = {train=train, station=train_station, station_name=station_name}
 
     -- Change the train schedule so that the train stays at the station
-    local wait_schedule = train.schedule
-    table.insert(wait_schedule.records, wait_schedule.current + 1,
-      {station=station_name, temporary=true, wait_conditions={{type="circuit", compare_type="or", condition={}}}})
-    wait_schedule.current = wait_schedule.current + 1
-    train.schedule = wait_schedule
+    local wait_record = {station=station_name, temporary=true, wait_conditions={{type="circuit", compare_type="or", condition={}}}, index={schedule_index=train_schedule.current+1}}
+    train_schedule.add_record(wait_record)
+    train_schedule.go_to_station(train_schedule.current + 1)
     debug("Train #", id, " has arrived to dispatcher ", train_station.surface.name, "/", station_name, ": awaiting dispatch")
   end
   
@@ -312,33 +317,37 @@ end
 -- Track uncoupled trains (because the train id changes)
 function train_created(event)
   local ad
+  local train = event.train
   if event.old_train_id_1 and event.old_train_id_2 then
     if storage.awaiting_dispatch[event.old_train_id_1] then
       ad = storage.awaiting_dispatch[event.old_train_id_1]
     elseif storage.awaiting_dispatch[event.old_train_id_2] then
       ad = storage.awaiting_dispatch[event.old_train_id_2]
     end
+    local train_schedule = train.get_schedule()
     if ad then
-      if event.train.schedule then
-        event.train.schedule = ad.schedule
-        event.train.manual_mode = false
-        storage.awaiting_dispatch[event.train.id] = nil
-        debug("Train #", event.old_train_id_1, " and #", event.old_train_id_2, " merged while awaiting dispatch: new train #", event.train.id, " schedule reset, and mode set to automatic")
+      if train_schedule.get_record_count() > 0 then
+        train_schedule.set_records(ad.schedule.records)
+        train_schedule.go_to_station(ad.schedule.current)
+        --train.manual_mode = false
+        storage.awaiting_dispatch[train.id] = nil
+        debug("Train #", event.old_train_id_1, " and #", event.old_train_id_2, " merged while awaiting dispatch: new train #", train.id, " schedule reset, and mode set to automatic")
       else
-        debug("Train #", event.old_train_id_1, " and #", event.old_train_id_2, " merged while awaiting dispatch: new train #", event.train.id, " set to manual because it has no schedule")
+        debug("Train #", event.old_train_id_1, " and #", event.old_train_id_2, " merged while awaiting dispatch: new train #", train.id, " set to manual because it has no schedule")
       end
       storage.awaiting_dispatch[event.old_train_id_2] = nil
       storage.awaiting_dispatch[event.old_train_id_1] = nil
     end
   elseif event.old_train_id_1 then
-    if storage.awaiting_dispatch[event.old_train_id_1] then
-      ad = storage.awaiting_dispatch[event.old_train_id_1]
-      event.train.schedule = ad.schedule
-      if has_locos(event.train) then
-        event.train.manual_mode = false
-        debug("Train #", event.old_train_id_1, " was split to create train #", event.train.id, " while awaiting dispatch: train schedule reset, and mode set to automatic")
+    ad = storage.awaiting_dispatch[event.old_train_id_1]
+    if ad then
+      train_schedule.set_records(ad.schedule.records)
+      train_schedule.go_to_station(ad.schedule.current)
+      if has_locos(train) then
+        train.manual_mode = false
+        debug("Train #", event.old_train_id_1, " was split to create train #", train.id, " while awaiting dispatch: train schedule reset, and mode set to automatic")
       else
-        debug("Train #", event.old_train_id_1, " was split to create train #", event.train.id, " while awaiting dispatch: train schedule reset, and mode set to manual because it has no locomotives")
+        debug("Train #", event.old_train_id_1, " was split to create train #", train.id, " while awaiting dispatch: train schedule reset, and mode set to manual because it has no locomotives")
       end
     end
   end
@@ -370,10 +379,10 @@ function tick()
           -- Search for valid destination station
           local found = false
           for _,station in pairs(storage.stations[surface_index][name]) do
-            -- Check that the station exists
-            if station.valid then
+            -- Check that the station exists and has space available
+            if station.valid and station.trains_count < station.trains_limit then
               local cb = station.get_control_behavior()
-              -- Check that the station in not disabled
+              -- Check that the station in not disabled (disabled station still shows positive train limit)
               if not cb or not cb.disabled then
                 found = true
                 break
@@ -383,18 +392,20 @@ function tick()
 
           if found then
             -- Get schedule of waiting train
-            local train_schedule = ad.train.schedule
-            if (train_schedule.current > 1 and
-                train_schedule.records[train_schedule.current].temporary and
-                train_schedule.records[train_schedule.current-1].station == dispatcher_name) then
+            local train_schedule = ad.train.get_schedule()
+            local current_index = train_schedule.current
+            if (current_index > 1 and
+                train_schedule.get_record{schedule_index=current_index}.temporary and
+                train_schedule.get_record{schedule_index=current_index-1}.station == dispatcher_name) then
 
               -- Currently at a temporary waiting stop. Delete it.
-              table.remove(train_schedule.records, train_schedule.current)
-              train_schedule.current = train_schedule.current - 1
+              train_schedule.remove_record{schedule_index=current_index}
+              train_schedule.go_to_station(current_index - 1)
 
             elseif ad.schedule then
               -- Waiting at a real stop or the schedule got messed up. Use stored schedule
-              train_schedule = ad.schedule
+              train_schedule.set_records(ad.schedule.records)
+              train_schedule.go_to_station(ad.schedule.current)
 
             else
               debug("Dispatcher: WARNING! Train "..id.." waiting at "..dispatcher_name.." could not be dispatched because schedule is missing.")
@@ -402,17 +413,23 @@ function tick()
             end
 
             if train_schedule then
-              if train_schedule.records[train_schedule.current].temporary then
+              local current_index = train_schedule.current
+              local current_record = train_schedule.get_record{schedule_index=current_index}
+              if current_record.temporary then
                 -- Arrived at this dispatcher with a temporary stop. Replace it with the dispatched destination, conditions stay the same.
-                train_schedule.records[train_schedule.current].station = name
+                current_record.station = name
+                current_record.index = {schedule_index=current_index}
+                train_schedule.remove_record{schedule_index=current_index}
+                train_schedule.add_record(current_record)
               else
                 -- Arrived at this dispatcher with a permanent stop. Add the temporary dispatched destination and copy the conditions.
-                table.insert(train_schedule.records, train_schedule.current + 1,
-                  {station=name, temporary=true, wait_conditions=train_schedule.records[train_schedule.current].wait_conditions} )
-                train_schedule.current = train_schedule.current + 1
+                current_record.station = name
+                current_record.temporary = true
+                current_record.index = {schedule_index=current_index+1}
+                train_schedule.add_record(current_record)
+                train_schedule.go_to_station(current_index + 1)
               end
 
-              ad.train.schedule = train_schedule
               ad.train.manual_mode = false
 
               for _, player in pairs(game.players) do
@@ -467,25 +484,25 @@ end
 
 -- Debug command
 function cmd_debug(params)
-  local toggle = params.parameter
-  if not toggle then
+  local action = params.parameter
+  if not action then
     if storage.debug then
-      toggle = "disable"
+      action = "disable"
     else
-      toggle = "enable"
+      action = "enable"
     end
   end
-  if toggle == "disable" then
+  if action == "disable" then
     storage.debug = false
     print_game("Debug mode disabled")
-  elseif toggle == "enable" then
+  elseif action == "enable" then
     storage.debug = true
     print_game("Debug mode enabled")
-  elseif toggle == "dump" then
+  elseif action == "dump" then
     for v, data in pairs(storage) do
       print_game(v, ": ", data)
     end
-  elseif toggle == "dumplog" then
+  elseif action == "dumplog" then
     for v, data in pairs(storage) do
       log(any_to_string(v, ": ", data))
     end
@@ -495,3 +512,18 @@ end
 commands.add_command("dispatcher-debug", {"command-help.dispatcher-debug"}, cmd_debug)
 
 if script.active_mods["gvv"] then require("__gvv__.gvv")() end
+
+------------------------------------------------------------------------------------
+--                    FIND LOCAL VARIABLES THAT ARE USED GLOBALLY                 --
+--                              (Thanks to eradicator!)                           --
+------------------------------------------------------------------------------------
+setmetatable(_ENV,{
+  __newindex=function (self,key,value) --locked_global_write
+    error('\n\n[ER Global Lock] Forbidden global *write*:\n'
+      .. serpent.line{key=key or '<nil>',value=value or '<nil>'}..'\n')
+    end,
+  __index   =function (self,key) --locked_global_read
+    error('\n\n[ER Global Lock] Forbidden global *read*:\n'
+      .. serpent.line{key=key or '<nil>'}..'\n')
+    end ,
+  })
