@@ -419,8 +419,9 @@ function tick()
                 -- Arrived at this dispatcher with a temporary stop. Replace it with the dispatched destination, conditions stay the same.
                 current_record.station = name
                 current_record.index = {schedule_index=current_index}
-                train_schedule.remove_record{schedule_index=current_index}
                 train_schedule.add_record(current_record)
+                train_schedule.remove_record{schedule_index=current_index+1}
+                train_schedule.go_to_station(current_index)
               else
                 -- Arrived at this dispatcher with a permanent stop. Add the temporary dispatched destination and copy the conditions.
                 current_record.station = name
