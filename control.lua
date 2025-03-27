@@ -268,15 +268,16 @@ function train_changed_state(event)
         end
       end
       if found then
-        train_schedule.set_records(stored_schedule.records)
-        train_schedule.go_to_station(stored_schedule.current)
-        if train.manual_mode then
-          debug("Train #", id, " set to manual mode while awaiting dispatch: schedule reset")
-        elseif not storage.awaiting_dispatch[id].station or not storage.awaiting_dispatch[id].station.valid then
-          debug("Train #", id, " was waiting at a dispatcher that no longer exists: schedule reset")
-        else
+        --log(storage.awaiting_dispatch[id].station_name)
+        --log(storage.awaiting_dispatch[id].station)
+        --log(storage.awaiting_dispatch[id].station.valid)
+        --if train.manual_mode then
+        --  debug("Train #", id, " set to manual mode while awaiting dispatch: schedule reset")
+        --elseif not storage.awaiting_dispatch[id].station or not storage.awaiting_dispatch[id].station.valid then
+        --  debug("Train #", id, " was waiting at a dispatcher that no longer exists: schedule reset")
+        --else
           debug("Train #", id, " left the dispatcher: schedule reset")
-        end
+        --end
       else
         debug("Dispatcher: WARNING! Train #", id, " no longer awaiting dispatch but schedule was not reset.")
       end
@@ -318,13 +319,13 @@ end
 function train_created(event)
   local ad
   local train = event.train
+  local train_schedule = train.get_schedule()
   if event.old_train_id_1 and event.old_train_id_2 then
     if storage.awaiting_dispatch[event.old_train_id_1] then
       ad = storage.awaiting_dispatch[event.old_train_id_1]
     elseif storage.awaiting_dispatch[event.old_train_id_2] then
       ad = storage.awaiting_dispatch[event.old_train_id_2]
     end
-    local train_schedule = train.get_schedule()
     if ad then
       if train_schedule.get_record_count() > 0 then
         train_schedule.set_records(ad.schedule.records)
@@ -341,8 +342,10 @@ function train_created(event)
   elseif event.old_train_id_1 then
     ad = storage.awaiting_dispatch[event.old_train_id_1]
     if ad then
-      train_schedule.set_records(ad.schedule.records)
-      train_schedule.go_to_station(ad.schedule.current)
+      if ad.schedule.records then
+        train_schedule.set_records(ad.schedule.records)
+        train_schedule.go_to_station(ad.schedule.current)
+      end
       if has_locos(train) then
         train.manual_mode = false
         debug("Train #", event.old_train_id_1, " was split to create train #", train.id, " while awaiting dispatch: train schedule reset, and mode set to automatic")
